@@ -105,9 +105,14 @@ async def build_graph_manually(driver_config, text, llm, embedder):
         return
 
     # == STEP 2: GENERATE embeddings for each node ==
+    # == STEP 2: GENERATE embeddings for each node ==
     status_placeholder.info("2/4 - Generating entity embeddings... 💡")
     node_texts = [node['id'] for node in nodes]
-    node_embeddings = await embedder.embed_documents(node_texts)
+
+    # Create a list of embedding tasks to run concurrently
+    embedding_coroutines = [embedder.embed_query(text) for text in node_texts]
+    # Run all embedding tasks and gather the results
+    node_embeddings = await asyncio.gather(*embedding_coroutines)
 
     # Add embeddings to the node data
     for node, embedding in zip(nodes, node_embeddings):
