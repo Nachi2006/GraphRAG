@@ -17,7 +17,6 @@ from utils.graph_utils import (
 from utils.helpers import cosine_similarity, top_k_similar
 
 load_dotenv()
-
 st.set_page_config(page_title="GraphRAG (Neo4j + Ollama)", layout="wide")
 st.title("📚 GraphRAG — ingest docs, build graph, ask questions")
 
