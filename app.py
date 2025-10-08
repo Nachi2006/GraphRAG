@@ -1,275 +1,110 @@
+
+# app.py
 import streamlit as st
-import asyncio
-from neo4j import AsyncGraphDatabase
-import os
-import json
 from dotenv import load_dotenv
-import re
+import os
+import asyncio
+import tempfile
+
+from utils.graph_utils import Neo4jAsyncDriver
+from utils.ingest_utils import extract_text_from_file, chunk_text
+from utils.embeddings_utils import get_embeddings
+from utils.llm_utils import get_llm
+from utils.graph_utils import (
+    create_document_with_chunks,
+    fetch_chunk_candidates
+)
+from utils.helpers import cosine_similarity, top_k_similar
+
 load_dotenv()
 
-# Import Ollama-specific classes from the library
-from neo4j_graphrag.embeddings import OllamaEmbeddings
-from neo4j_graphrag.llm import OllamaLLM
+st.set_page_config(page_title="GraphRAG (Neo4j + Ollama)", layout="wide")
+st.title("📚 GraphRAG — ingest docs, build graph, ask questions")
 
-# --- App Configuration ---
-VECTOR_INDEX_NAME = "entity_embeddings"
-EMBEDDING_DIM = 768  # Dimensions for the default ollama embedding model (e.g., nomic-embed-text)
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-OLLAMA_LLM_MODEL = os.getenv("LLM")
-OLLAMA_EMBEDDING_MODEL = os.getenv("EMBED")
+# --- Initialize async loop & driver ---
+@st.cache_resource
+def get_event_loop():
+    import asyncio
+    return asyncio.new_event_loop()
 
-# --- Core GraphRAG Functions (Adapted for Ollama & Streamlit) ---
+loop = get_event_loop()
 
-async def build_graph_manually(driver_config, text, llm, embedder):
-    """
-    Manually builds a knowledge graph by performing the following steps:
-    1.  Extracts entities and relationships from text using an LLM.
-    2.  Generates embeddings for each entity.
-    3.  Loads the graph data into Neo4j.
-    """
-    status_placeholder = st.empty()
+@st.cache_resource
+def init_driver():
+    driver = Neo4jAsyncDriver.from_env()
+    return driver
 
-    # == STEP 1: EXTRACT entities and relationships using the LLM ==
-    status_placeholder.info("1/4 - Extracting entities & relationships... 🧠")
+driver = init_driver()
+embeddings = get_embeddings()
+llm = get_llm()
 
-    # Define the schema and create a detailed prompt for the LLM
-    schema = {
-        "node_types": ["Person", "House", "Planet"],
-        "relationship_types": ["PARENT_OF", "HEIR_OF", "RULES"]
-    }
-    
-    extract_prompt = f"""
-    You are an expert at extracting a knowledge graph from a given text.
-    Your task is to identify entities and relationships that match the provided schema.
-    Extract the information and format it as a JSON object with two keys: "nodes" and "relationships".
+# Sidebar settings
+st.sidebar.header("Ingestion settings")
+chunk_size = st.sidebar.number_input("Chunk size (chars)", min_value=200, max_value=5000, value=1000)
+chunk_overlap = st.sidebar.number_input("Chunk overlap (chars)", min_value=0, max_value=500, value=200)
+max_candidates = st.sidebar.number_input("Max candidates to fetch from DB", min_value=10, max_value=2000, value=500)
+top_k = st.sidebar.number_input("Top K chunks for RAG", min_value=1, max_value=30, value=5)
 
-    Schema:
-    Node Types: {schema['node_types']}
-    Relationship Types: {schema['relationship_types']}
+# --- Tabs ---
+tab1, tab2 = st.tabs(["Ingest documents", "Ask questions"])
 
-    Rules:
-    - Each node must have an 'id' (a unique string) and a 'type'.
-    - Each relationship must have a 'source' (the id of the source node), a 'target' (the id of the target node), and a 'type'.
-    - The source and target of a relationship must be one of the provided node types.
+with tab1:
+    st.header("Upload documents to build the knowledge graph")
+    uploaded = st.file_uploader("Upload PDF / TXT / DOCX (or multiple)", accept_multiple_files=True, type=["pdf", "txt", "docx"])
+    source_name = st.text_input("Source name (e.g., 'HR Handbook' or filename prefix')", value="uploaded_source")
+    if st.button("Ingest files") and uploaded:
+        status_box = st.empty()
+        total_chunks = 0
+        for file in uploaded:
+            status_box.info(f"Ingesting {file.name} ...")
+            # Save to temp file and extract text
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1]) as tmp:
+                tmp.write(file.getbuffer())
+                tmp_path = tmp.name
+            raw_text = extract_text_from_file(tmp_path)
+            # chunk
+            chunks = chunk_text(raw_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            total_chunks += len(chunks)
+            # embed chunks in batches
+            batch_size = 32
+            embeddings_list = []
+            for i in range(0, len(chunks), batch_size):
+                batch_texts = [c["text"] for c in chunks[i:i+batch_size]]
+                embs = embeddings.embed_documents(batch_texts)
+                embeddings_list.extend(embs)
+            # create Document node and Chunk nodes in Neo4j
+            loop.run_until_complete(create_document_with_chunks(
+                driver=driver,
+                doc_props={"title": file.name, "source": source_name},
+                chunks=[{**chunks[i], "embedding": embeddings_list[i]} for i in range(len(chunks))]
+            ))
+            status_box.success(f"Ingested {file.name} — {len(chunks)} chunks")
+        st.success(f"Finished ingesting {len(uploaded)} file(s), created {total_chunks} chunks.")
 
-    Example:
-    Text: "The son of Duke Leto Atreides and the Lady Jessica, Paul is the heir of House Atreides, an aristocratic family that rules the planet Caladan."
-    JSON Output:
-    {{
-      "nodes": [
-        {{ "id": "Paul Atreides", "type": "Person" }},
-        {{ "id": "Leto Atreides", "type": "Person" }},
-        {{ "id": "Lady Jessica", "type": "Person" }},
-        {{ "id": "House Atreides", "type": "House" }},
-        {{ "id": "Caladan", "type": "Planet" }}
-      ],
-      "relationships": [
-        {{ "source": "Leto Atreides", "target": "Paul Atreides", "type": "PARENT_OF" }},
-        {{ "source": "Lady Jessica", "target": "Paul Atreides", "type": "PARENT_OF" }},
-        {{ "source": "Paul Atreides", "target": "House Atreides", "type": "HEIR_OF" }},
-        {{ "source": "House Atreides", "target": "Caladan", "type": "RULES" }}
-      ]
-    }}
-
-    Now, extract the graph from the following text:
-    Text: "{text}"
-    """
-    
-    # Get the structured data from the LLM
-    extraction_response = await llm.ainvoke(extract_prompt)
-    llm_output = extraction_response.content
-
-    # Use regex to find and extract the JSON content from the markdown block
-    match = re.search(r'```json\s*(.*?)\s*```', llm_output, re.DOTALL)
-    
-    if match:
-        json_string = match.group(1)
-    else:
-        # If no markdown block is found, assume the whole output is the JSON
-        json_string = llm_output
-
-    try:
-        graph_data = json.loads(json_string)
-    except json.JSONDecodeError:
-        st.error("The LLM did not return valid JSON. Please try again or adjust the text.")
-        st.code(llm_output) # Show the original, uncleaned output for debugging
-        return
-
-    nodes = graph_data.get("nodes", [])
-    relationships = graph_data.get("relationships", [])
-
-    if not nodes:
-        st.warning("No nodes were extracted from the text.")
-        return
-
-    # == STEP 2: GENERATE embeddings for each node ==
-    # == STEP 2: GENERATE embeddings for each node ==
-    status_placeholder.info("2/4 - Generating entity embeddings... 💡")
-    node_texts = [node['id'] for node in nodes]
-
-    # Create a list of embedding tasks to run concurrently
-    embedding_coroutines = [embedder.embed_query(text) for text in node_texts]
-    # Run all embedding tasks and gather the results
-    node_embeddings = await asyncio.gather(*embedding_coroutines)
-
-    # Add embeddings to the node data
-    for node, embedding in zip(nodes, node_embeddings):
-        node['embedding'] = embedding
-
-    # == STEP 3: LOAD the graph into Neo4j ==
-    status_placeholder.info("3/4 - Loading graph into Neo4j... 🚀")
-    driver = AsyncGraphDatabase.driver(**driver_config)
-    async with driver.session() as session:
-        # Use UNWIND to create all nodes in a single, efficient transaction
-        await session.run(
-            """
-            UNWIND $nodes AS node_data
-            // Use apoc.merge.node for dynamic labels
-            CALL apoc.merge.node([node_data.type], {id: node_data.id}, {embedding: node_data.embedding}, {})
-            YIELD node
-            RETURN count(node)
-            """,
-            nodes=nodes
+with tab2:
+    st.header("Ask questions (RAG)")
+    question = st.text_area("Enter question about ingested docs")
+    if st.button("Get answer") and question.strip():
+        st.info("Computing embeddings and retrieving relevant chunks...")
+        q_emb = embeddings.embed_query(question)
+        # fetch candidate chunks from DB
+        candidates = loop.run_until_complete(fetch_chunk_candidates(driver=driver, limit=max_candidates))
+        # candidates: list of dicts with 'text' and 'embedding'
+        # compute similarity
+        ranked = top_k_similar(q_emb, candidates, k=top_k)
+        st.write("### 🔎 Retrieved context chunks (top results)")
+        for i, item in enumerate(ranked):
+            st.write(f"**Rank {i+1} (score: {item['score']:.4f})** — source: {item.get('source','unknown')}")
+            st.write(item["text"][:1000] + ("…" if len(item["text"])>1000 else ""))
+            st.write("---")
+        # Build prompt for LLM
+        context_text = "\n\n---\n\n".join([c["text"] for c in ranked])
+        prompt = (
+            "You are a helpful assistant. Use the context below to answer the question. "
+            "If the answer is not contained in the context, say you don't know or provide best-effort reasoning.\n\n"
+            f"Context:\n{context_text}\n\nQuestion: {question}\n\nAnswer:"
         )
-
-        # Use UNWIND to create all relationships in a single transaction
-        # NOTE: This requires the APOC plugin in Neo4j for dynamic relationship types
-        await session.run(
-            """
-            UNWIND $relationships AS rel_data
-            MATCH (source {id: rel_data.source})
-            MATCH (target {id: rel_data.target})
-            // Use apoc.merge.relationship for dynamic relationship types
-            CALL apoc.merge.relationship(source, rel_data.type, {}, {}, target)
-            YIELD rel
-            RETURN count(rel)
-            """,
-            relationships=relationships
-        )
-    await driver.close()
-    
-    status_placeholder.success("Graph data loaded successfully!")
-
-    # == STEP 4: CREATE the vector index ==
-    status_placeholder.info("4/4 - Creating vector index... 🔍")
-    driver = AsyncGraphDatabase.driver(**driver_config)
-    async with driver.session() as session:
-        await session.run(
-            f"""
-            CREATE VECTOR INDEX {VECTOR_INDEX_NAME} IF NOT EXISTS
-            FOR (n) ON (n.embedding)
-            OPTIONS {{ indexConfig: {{
-                `vector.dimensions`: {EMBEDDING_DIM},
-                `vector.similarity_function`: 'cosine'
-            }} }}
-            """
-        )
-    await driver.close()
-    status_placeholder.success("Graph building complete!")
-
-
-async def answer_question_with_graphrag(driver_config, question, llm, embedder):
-    """
-    Performs the RAG process: retrieves context from the graph and generates an answer using Ollama.
-    """
-    driver = AsyncGraphDatabase.driver(**driver_config)
-
-    # 1. Embed the user's question
-    question_embedding = await embedder.embed_query(question)
-
-    # 2. Retrieve context from the graph
-    cypher_query = f"""
-        CALL db.index.vector.queryNodes('{VECTOR_INDEX_NAME}', 5, $embedding) YIELD node, score
-        MATCH (node)-[r]-(neighbor)
-        RETURN node.id as entity, type(r) as relationship, neighbor.id as neighbor
-    """
-    async with driver.session() as session:
-        result = await session.run(cypher_query, embedding=question_embedding)
-        context_list = [record.data() async for record in result]
-
-    if not context_list:
-        context = "No information found in the graph."
-    else:
-        context = "\n".join([str(item) for item in context_list])
-
-    # 3. Generate an answer using the LLM
-    prompt = f"""
-    You are a helpful assistant. Use the following information from a knowledge graph
-    to answer the question.
-
-    Context from the graph:
-    {context}
-
-    Question: {question}
-
-    Answer:
-    """
-    
-    with st.expander("📝 View Retrieved Context & Prompt"):
-        st.code(f"Context:\n{context}\n\nQuestion:\n{question}", language="text")
-
-    response = await llm.ainvoke(prompt)
-    await driver.close()
-    return response.content
-
-# --- Streamlit UI ---
-
-st.set_page_config(page_title="GraphRAG with Neo4j & Ollama", layout="wide")
-st.title("GraphRAG with Neo4j & Ollama 📈")
-st.info("This app demonstrates how to build a Knowledge Graph from text and answer questions about it using local LLMs with Ollama.")
-
-# Initialize session state
-if "graph_built" not in st.session_state:
-    st.session_state.graph_built = False
-
-driver_config = {"uri": NEO4J_URI, "auth": (NEO4J_USERNAME, NEO4J_PASSWORD)}
-
-# --- Main App Layout ---
-col1, col2 = st.columns(2)
-
-with col1:
-    st.header("1. Build Knowledge Graph")
-    dune_text_default = (
-        "The son of Duke Leto Atreides and the Lady Jessica, Paul is the heir of House "
-        "Atreides, an aristocratic family that rules the planet Caladan."
-    )
-    text_input = st.text_area("Enter text to build the graph from:", value=dune_text_default, height=150)
-    
-    if st.button("Build Graph", type="primary"):
-        if not text_input:
-            st.error("Please enter some text to build the graph.")
-        else:
-            with st.spinner("Processing..."):
-                try:
-                    # Instantiate models here
-                    llm = OllamaLLM(model_name=OLLAMA_LLM_MODEL)
-                    embedder = OllamaEmbeddings(model=OLLAMA_EMBEDDING_MODEL)
-                    
-                    asyncio.run(build_graph_manually(driver_config, text_input, llm, embedder))
-                    st.session_state.graph_built = True
-                except Exception as e:
-                    st.error(f"An error occurred: {e}")
-
-with col2:
-    st.header("2. Ask a Question")
-    question = st.text_input("Ask a question about the text:", "Who rules the planet Caladan?")
-
-    if st.button("Get Answer"):
-        if not st.session_state.graph_built:
-            st.warning("Please build the graph first before asking a question.")
-        elif not question:
-            st.error("Please enter a question.")
-        else:
-            with st.spinner("Finding answer..."):
-                try:
-                    # Instantiate models here for the question-answering part
-                    llm = OllamaLLM(model_name=OLLAMA_LLM_MODEL)
-                    embedder = OllamaEmbeddings(model=OLLAMA_EMBEDDING_MODEL)
-                    
-                    answer = asyncio.run(answer_question_with_graphrag(driver_config, question, llm, embedder))
-                    st.success("Answer:")
-                    st.markdown(answer)
-                except Exception as e:
-                    st.error(f"An error occurred: {e}")
+        st.info("Calling LLM...")
+        llm_response = llm(prompt)
+        st.write("### 🤖 LLM answer")
+        st.write(llm_response)
